@@ -2,12 +2,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import re
 from typing import Dict, List, Optional
+import pandas as pd
 import PIL.Image
 import pytesseract
 import streamlit as st
 
 st.set_page_config(
-    page_title="Universal Receipt OCR Parser",
+    page_title="Universal Receipt OCR Parser & Editor",
     page_icon="🧾",
     layout="centered"
 )
@@ -42,8 +43,7 @@ class ReceiptSummary:
 
 def clean_amount(val_str: str) -> float:
     """Extracts floating point values while ignoring OCR artifacts and tax flags (FT, F, T)."""
-    # Remove tax flags/symbols like FT, F, T, wt, etc.
-    cleaned = re.sub(r"(?i)\b(FT|F|T|WT)\b", "", val_str)
+    cleaned = re.sub(r"(?i)\b(FT|F|T|WT)\b", "", str(val_str))
     sanitized = re.sub(r"[^\d.]", "", cleaned)
     
     parts = sanitized.split(".")
@@ -61,23 +61,19 @@ def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
 
     item_aggregation: Dict[str, Dict[str, float]] = {}
     
-    # Header and Footer exclusion keywords
     stop_keywords = [
         "sub total", "subtotal", "sales tax", "total due", 
         "card", "change", "total savings", "thank you", "mylidl"
     ]
 
-    pending_item_name: Optional[str] = None
     pending_qty: int = 1
 
     for line in lines:
         line_lower = line.lower()
 
-        # Stop parsing line items once reaching subtotal/footer block
         if any(keyword in line_lower for keyword in stop_keywords):
             break
 
-        # Check for multiplier / weight lines like "2.0 @ 2.99" or "4.02 lb @ $0.59/lb"
         qty_modifier_match = re.search(r"^(\d+(?:\.\d+)?)\s*(?:lb|pcs|x)?\s*@\s*[\$€]?\s*([\d.]+)", line, re.I)
         if qty_modifier_match:
             try:
@@ -86,24 +82,19 @@ def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
                 pending_qty = 1
             continue
 
-        # Matching items ending in a price and optional tax flags (e.g. "3.98 FT", "3.47 T", "2.98) py")
         item_match = re.search(r"^(.+?)\s+([\d]+\.[\d]{2})\s*(?:FT|F|T|WT|py|fF|pr)?$", line, re.I)
 
         if item_match:
             raw_name, price_str = item_match.groups()
-            
-            # Clean OCR artifacts from item name
             clean_name = re.sub(r"[{}|~‘'\"\[\]]", "", raw_name).strip().title()
 
-            # Skip header lines misidentified as items
             if any(h in clean_name.lower() for h in ["welcome", "store", "organic", "item"]):
-                if not re.search(r"\d", clean_name):  # Keep item if it has numbers
+                if not re.search(r"\d", clean_name):
                     continue
 
             price = clean_amount(price_str)
             qty = pending_qty if pending_qty > 0 else 1
 
-            # Consolidate and aggregate repeated purchases
             if clean_name in item_aggregation:
                 item_aggregation[clean_name]["quantity"] += qty
                 item_aggregation[clean_name]["total_price"] += price
@@ -113,11 +104,8 @@ def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
                     "total_price": price
                 }
 
-            # Reset modifier state
             pending_qty = 1
-            pending_item_name = None
 
-    # Structure extracted items
     items_list: List[AggregatedItem] = []
     for name, data in item_aggregation.items():
         items_list.append(
@@ -128,7 +116,6 @@ def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
             )
         )
 
-    # Extract Totals
     subtotal = 0.0
     subtotal_match = re.search(r"(?:sub\s*total|subtotal)[\s:]*[\$€]?\s*([\d,]+\.\d{2})", raw_text, re.I)
     if subtotal_match:
@@ -162,8 +149,8 @@ def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
 # ==========================================
 
 def main():
-    st.title("🧾 Universal Receipt OCR Parser")
-    st.write("Upload a receipt image to automatically extract items, group duplicates, and calculate financial totals.")
+    st.title("🧾 Interactive Receipt OCR Parser")
+    st.write("Upload a receipt image to extract items, then manually edit or add rows if OCR misreads any text.")
 
     uploaded_file = st.file_uploader("Upload Receipt", type=["png", "jpg", "jpeg", "webp"])
 
@@ -180,38 +167,57 @@ def main():
                     custom_config = r'--oem 1 --psm 6'
                     raw_text = pytesseract.image_to_string(image, config=custom_config)
                     summary = parse_lidl_us_receipt(raw_text)
-                    st.success("Receipt processed successfully!")
+                    st.success("OCR extraction finished!")
                 except Exception as e:
                     st.error(f"OCR Execution Error: {e}")
                     return
 
         st.divider()
 
-        # High-Level Metrics
-        st.subheader("📊 Financial Summary")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Items Count", f"{summary.total_items_count} pcs")
-        m2.metric("Subtotal", f"${summary.subtotal:,.2f}")
-        m3.metric("Sales Tax", f"${summary.sales_tax:,.2f}")
-        m4.metric("Total Due", f"${summary.grand_total:,.2f}")
+        st.subheader("📝 Edit & Review Extracted Items")
+        st.caption("You can directly edit item names, quantities, or prices in the table below, or click '+' to add missing items.")
+
+        # Prepare Pandas DataFrame for st.data_editor
+        initial_data = [
+            {
+                "Product Description": item.item_name,
+                "Quantity": item.quantity,
+                "Total Price ($)": item.total_price
+            }
+            for item in summary.items
+        ]
+        
+        df_initial = pd.DataFrame(initial_data if initial_data else [{"Product Description": "", "Quantity": 1, "Total Price ($)": 0.0}])
+
+        # Interactive Editable Table
+        edited_df = st.data_editor(
+            df_initial,
+            num_rows="dynamic",  # Allows adding/deleting rows
+            column_config={
+                "Product Description": st.column_config.TextColumn("Product Description", required=True),
+                "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
+                "Total Price ($)": st.column_config.NumberColumn("Total Price ($)", min_value=0.0, format="$%.2f", required=True)
+            },
+            use_container_width=True
+        )
+
+        # Recalculate metrics in real-time from user's edits
+        edited_df["Quantity"] = pd.to_numeric(edited_df["Quantity"], errors="coerce").fillna(0).astype(int)
+        edited_df["Total Price ($)"] = pd.to_numeric(edited_df["Total Price ($)"], errors="coerce").fillna(0.0)
+
+        updated_item_count = int(edited_df["Quantity"].sum())
+        updated_subtotal = float(edited_df["Total Price ($)"].sum())
+        updated_grand_total = updated_subtotal + summary.sales_tax
 
         st.divider()
 
-        # Itemized Table
-        st.subheader("🛍️ Extracted Grocery Items")
-        if summary.items:
-            table_data = [
-                {
-                    "Product Description": item.item_name,
-                    "Quantity": item.quantity,
-                    "Est. Unit Price": f"${item.unit_price:.2f}",
-                    "Total Price": f"${item.total_price:.2f}"
-                }
-                for item in summary.items
-            ]
-            st.dataframe(table_data, use_container_width=True)
-        else:
-            st.warning("No line items detected. Inspect raw OCR text below.")
+        # Dynamic Financial Metrics Display
+        st.subheader("📊 Dynamic Summary")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Items Count", f"{updated_item_count} pcs")
+        m2.metric("Subtotal", f"${updated_subtotal:,.2f}")
+        m3.metric("Sales Tax", f"${summary.sales_tax:,.2f}")
+        m4.metric("Total Due", f"${updated_grand_total:,.2f}")
 
         with st.expander("View Raw OCR Text"):
             st.code(raw_text)
