@@ -1,13 +1,13 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 import PIL.Image
 import pytesseract
 import streamlit as st
 
 st.set_page_config(
-    page_title="Adaptive Receipt OCR Parser",
+    page_title="Universal Receipt OCR Parser",
     page_icon="🧾",
     layout="centered"
 )
@@ -29,29 +29,97 @@ class AggregatedItem:
 
 @dataclass
 class ReceiptSummary:
-    total_items_count: int
+    subtotal: float
+    sales_tax: float
     grand_total: float
+    total_items_count: int
     items: List[AggregatedItem] = field(default_factory=list)
-    parsed_mode: str = "Single-Line"  # Tracks which strategy succeeded
 
 
 # ==========================================
-# 2. Dual-Mode Parsing Core
+# 2. Resilient US/Global Receipt Parser
 # ==========================================
 
 def clean_amount(val_str: str) -> float:
-    """Strips currency codes and non-numeric characters except decimals."""
-    sanitized = re.sub(r"[^\d.]", "", val_str)
+    """Extracts floating point values while ignoring OCR artifacts and tax flags (FT, F, T)."""
+    # Remove tax flags/symbols like FT, F, T, wt, etc.
+    cleaned = re.sub(r"(?i)\b(FT|F|T|WT)\b", "", val_str)
+    sanitized = re.sub(r"[^\d.]", "", cleaned)
+    
+    parts = sanitized.split(".")
+    if len(parts) > 2:
+        sanitized = f"{parts[0]}.{parts[1]}"
     try:
         return float(sanitized) if sanitized else 0.0
     except ValueError:
         return 0.0
 
 
-def consolidate_items(item_dict: Dict[str, Dict[str, float]]) -> List[AggregatedItem]:
-    """Converts and aggregates raw dictionary entries into typed structs."""
+def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
+    raw_lines = raw_text.splitlines()
+    lines = [line.strip() for line in raw_lines if line.strip()]
+
+    item_aggregation: Dict[str, Dict[str, float]] = {}
+    
+    # Header and Footer exclusion keywords
+    stop_keywords = [
+        "sub total", "subtotal", "sales tax", "total due", 
+        "card", "change", "total savings", "thank you", "mylidl"
+    ]
+
+    pending_item_name: Optional[str] = None
+    pending_qty: int = 1
+
+    for line in lines:
+        line_lower = line.lower()
+
+        # Stop parsing line items once reaching subtotal/footer block
+        if any(keyword in line_lower for keyword in stop_keywords):
+            break
+
+        # Check for multiplier / weight lines like "2.0 @ 2.99" or "4.02 lb @ $0.59/lb"
+        qty_modifier_match = re.search(r"^(\d+(?:\.\d+)?)\s*(?:lb|pcs|x)?\s*@\s*[\$€]?\s*([\d.]+)", line, re.I)
+        if qty_modifier_match:
+            try:
+                pending_qty = int(float(qty_modifier_match.group(1)))
+            except ValueError:
+                pending_qty = 1
+            continue
+
+        # Matching items ending in a price and optional tax flags (e.g. "3.98 FT", "3.47 T", "2.98) py")
+        item_match = re.search(r"^(.+?)\s+([\d]+\.[\d]{2})\s*(?:FT|F|T|WT|py|fF|pr)?$", line, re.I)
+
+        if item_match:
+            raw_name, price_str = item_match.groups()
+            
+            # Clean OCR artifacts from item name
+            clean_name = re.sub(r"[{}|~‘'\"\[\]]", "", raw_name).strip().title()
+
+            # Skip header lines misidentified as items
+            if any(h in clean_name.lower() for h in ["welcome", "store", "organic", "item"]):
+                if not re.search(r"\d", clean_name):  # Keep item if it has numbers
+                    continue
+
+            price = clean_amount(price_str)
+            qty = pending_qty if pending_qty > 0 else 1
+
+            # Consolidate and aggregate repeated purchases
+            if clean_name in item_aggregation:
+                item_aggregation[clean_name]["quantity"] += qty
+                item_aggregation[clean_name]["total_price"] += price
+            else:
+                item_aggregation[clean_name] = {
+                    "quantity": qty,
+                    "total_price": price
+                }
+
+            # Reset modifier state
+            pending_qty = 1
+            pending_item_name = None
+
+    # Structure extracted items
     items_list: List[AggregatedItem] = []
-    for name, data in item_dict.items():
+    for name, data in item_aggregation.items():
         items_list.append(
             AggregatedItem(
                 item_name=name,
@@ -59,108 +127,33 @@ def consolidate_items(item_dict: Dict[str, Dict[str, float]]) -> List[Aggregated
                 total_price=round(data["total_price"], 2)
             )
         )
-    return items_list
 
+    # Extract Totals
+    subtotal = 0.0
+    subtotal_match = re.search(r"(?:sub\s*total|subtotal)[\s:]*[\$€]?\s*([\d,]+\.\d{2})", raw_text, re.I)
+    if subtotal_match:
+        subtotal = clean_amount(subtotal_match.group(1))
 
-def parse_single_line(lines: List[str]) -> Dict[str, Dict[str, float]]:
-    """Strategy A: Single-line item pattern matching (e.g., '2x Sugar 4.50' or 'Sugar 2.25')."""
-    item_aggregation: Dict[str, Dict[str, float]] = {}
-    line_item_pattern = r"^(?:(\d+)\s*x\s*)?(.+?)\s+[\$€Rs\.]?\s*([\d,]+\.\d{2})$"
-    ignore_keywords = {"total", "subtotal", "tax", "vat", "gst", "cash", "card", "change", "balance", "amount"}
+    sales_tax = 0.0
+    tax_match = re.search(r"(?:sales\s*tax|tax)[\s:]*[\$€]?\s*([\d,]+\.\d{2})", raw_text, re.I)
+    if tax_match:
+        sales_tax = clean_amount(tax_match.group(1))
 
-    for line in lines:
-        if any(keyword in line.lower() for keyword in ignore_keywords):
-            continue
-
-        match = re.match(line_item_pattern, line, re.I)
-        if match:
-            qty_str, raw_name, price_str = match.groups()
-            qty = int(qty_str) if qty_str else 1
-            price = clean_amount(price_str)
-            clean_name = raw_name.strip().title()
-
-            if clean_name in item_aggregation:
-                item_aggregation[clean_name]["quantity"] += qty
-                item_aggregation[clean_name]["total_price"] += price
-            else:
-                item_aggregation[clean_name] = {"quantity": qty, "total_price": price}
-
-    return item_aggregation
-
-
-def parse_multi_line(lines: List[str]) -> Dict[str, Dict[str, float]]:
-    """Strategy B: Multi-line pattern matching (Line N = Name, Line N+1 = Qty/Price block)."""
-    item_aggregation: Dict[str, Dict[str, float]] = {}
-    num_line_pattern = r"^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(?:Rs|Rs\.|[\$€])?\s*([\d,]+(?:\.\d+)?)$"
-    stop_keywords = ["total items", "discount", "rounding", "invoice value", "sale tax", "payments", "change due"]
-
-    for i in range(len(lines)):
-        line = lines[i]
-        if any(keyword in line.lower() for keyword in stop_keywords):
-            break
-
-        num_match = re.search(num_line_pattern, line, re.I)
-        if num_match and i > 0:
-            item_name = lines[i - 1].strip()
-            if any(h in item_name.lower() for h in ["product description", "sales items", "original receipt"]):
-                continue
-
-            qty = int(float(num_match.group(1)))
-            total_price = clean_amount(num_match.group(4))
-            clean_name = item_name.title()
-
-            if clean_name in item_aggregation:
-                item_aggregation[clean_name]["quantity"] += qty
-                item_aggregation[clean_name]["total_price"] += total_price
-            else:
-                item_aggregation[clean_name] = {"quantity": qty, "total_price": total_price}
-
-    return item_aggregation
-
-
-def parse_receipt_auto(raw_text: str) -> ReceiptSummary:
-    """
-    Adaptive engine: Attempts Single-Line parsing first; automatically falls back 
-    to Multi-Line parsing if Single-Line yields no items or poor coverage.
-    """
-    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-
-    # 1. Attempt Single-Line Parsing
-    single_dict = parse_single_line(lines)
-    
-    # 2. Check threshold: If single-line parser found items, accept it; otherwise fallback
-    if len(single_dict) >= 2:
-        selected_dict = single_dict
-        mode = "Single-Line Mode"
-    else:
-        # Fallback to Multi-Line Parsing
-        multi_dict = parse_multi_line(lines)
-        if len(multi_dict) > 0:
-            selected_dict = multi_dict
-            mode = "Multi-Line Mode (Fallback)"
-        else:
-            # If both yield < 2 items, take whichever found more
-            selected_dict = single_dict if len(single_dict) >= len(multi_dict) else multi_dict
-            mode = "Single-Line Mode" if len(single_dict) >= len(multi_dict) else "Multi-Line Mode"
-
-    # Consolidate duplicate items
-    items_list = consolidate_items(selected_dict)
-
-    # 3. Extract Grand Total from footer or sum items
     grand_total = 0.0
-    total_match = re.search(r"(?:invoice value|grand total|total due|total)[\s:]*(?:Rs|Rs\.|[\$€])?\s*([\d,]+\.\d{2})", raw_text, re.I)
+    total_match = re.search(r"(?:total\s*due|grand\s*total|total)[\s:]*[\$€]?\s*([\d,]+\.\d{2})", raw_text, re.I)
     if total_match:
         grand_total = clean_amount(total_match.group(1))
     else:
-        grand_total = round(sum(item.total_price for item in items_list), 2)
+        grand_total = round(subtotal + sales_tax, 2)
 
     total_items_count = sum(item.quantity for item in items_list)
 
     return ReceiptSummary(
-        total_items_count=total_items_count,
+        subtotal=subtotal,
+        sales_tax=sales_tax,
         grand_total=grand_total,
-        items=items_list,
-        parsed_mode=mode
+        total_items_count=total_items_count,
+        items=items_list
     )
 
 
@@ -169,8 +162,8 @@ def parse_receipt_auto(raw_text: str) -> ReceiptSummary:
 # ==========================================
 
 def main():
-    st.title("🧾 Adaptive Grocery Receipt Parser")
-    st.write("Upload a receipt image. The app automatically detects layout format (Single-Line vs Multi-Line) and aggregates duplicate items.")
+    st.title("🧾 Universal Receipt OCR Parser")
+    st.write("Upload a receipt image to automatically extract items, group duplicates, and calculate financial totals.")
 
     uploaded_file = st.file_uploader("Upload Receipt", type=["png", "jpg", "jpeg", "webp"])
 
@@ -182,11 +175,11 @@ def main():
             st.image(image, caption="Uploaded Receipt", use_container_width=True)
 
         with col2:
-            with st.spinner("Executing OCR & Auto-Detecting Layout..."):
+            with st.spinner("Executing OCR & Extracting Items..."):
                 try:
                     custom_config = r'--oem 1 --psm 6'
                     raw_text = pytesseract.image_to_string(image, config=custom_config)
-                    summary = parse_receipt_auto(raw_text)
+                    summary = parse_lidl_us_receipt(raw_text)
                     st.success("Receipt processed successfully!")
                 except Exception as e:
                     st.error(f"OCR Execution Error: {e}")
@@ -194,30 +187,31 @@ def main():
 
         st.divider()
 
-        # Summary Metrics
-        st.subheader("📊 Receipt Summary")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Detection Mode", summary.parsed_mode)
-        m2.metric("Total Items Count", f"{summary.total_items_count} pcs")
-        m3.metric("Grand Total Amount", f"Rs {summary.grand_total:,.2f}")
+        # High-Level Metrics
+        st.subheader("📊 Financial Summary")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Items Count", f"{summary.total_items_count} pcs")
+        m2.metric("Subtotal", f"${summary.subtotal:,.2f}")
+        m3.metric("Sales Tax", f"${summary.sales_tax:,.2f}")
+        m4.metric("Total Due", f"${summary.grand_total:,.2f}")
 
         st.divider()
 
-        # Detailed Consolidated Table
-        st.subheader("🛍️ Extracted & Consolidated Items")
+        # Itemized Table
+        st.subheader("🛍️ Extracted Grocery Items")
         if summary.items:
             table_data = [
                 {
                     "Product Description": item.item_name,
                     "Quantity": item.quantity,
-                    "Unit Price": f"Rs {item.unit_price:.2f}",
-                    "Total Price": f"Rs {item.total_price:.2f}"
+                    "Est. Unit Price": f"${item.unit_price:.2f}",
+                    "Total Price": f"${item.total_price:.2f}"
                 }
                 for item in summary.items
             ]
             st.dataframe(table_data, use_container_width=True)
         else:
-            st.warning("No line items extracted. Inspect raw text below.")
+            st.warning("No line items detected. Inspect raw OCR text below.")
 
         with st.expander("View Raw OCR Text"):
             st.code(raw_text)
