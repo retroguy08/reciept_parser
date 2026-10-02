@@ -8,7 +8,7 @@ import pytesseract
 import streamlit as st
 
 # ==========================================
-# 1. Page Config & Custom Styling
+# 1. Page Config & CSS Theme Fixes
 # ==========================================
 
 st.set_page_config(
@@ -17,31 +17,35 @@ st.set_page_config(
     layout="wide"
 )
 
-# Inject CSS for polished dashboard visuals
+# Custom CSS with strict contrast colors compatible with Dark & Light Streamlit themes
 st.markdown("""
 <style>
-    /* Metric Card Styling */
+    /* Metric Card Styling with adaptive text colors */
     div[data-testid="stMetric"] {
-        background-color: #f8f9fa;
-        border: 1px solid #e9ecef;
-        padding: 15px 20px;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+        background-color: #1E293B !important;
+        border: 1px solid #334155 !important;
+        padding: 16px 20px !important;
+        border-radius: 12px !important;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1) !important;
     }
     div[data-testid="stMetric"] label {
-        font-weight: 600;
-        color: #495057;
+        font-weight: 600 !important;
+        color: #94A3B8 !important;
+        font-size: 0.9rem !important;
     }
-    /* Main Header Styling */
+    div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+        color: #F8FAFC !important;
+        font-weight: 700 !important;
+    }
     .main-title {
         font-size: 2.2rem;
         font-weight: 700;
-        color: #1E293B;
+        color: #F8FAFC;
         margin-bottom: 0.2rem;
     }
     .sub-title {
         font-size: 1rem;
-        color: #64748B;
+        color: #94A3B8;
         margin-bottom: 1.5rem;
     }
 </style>
@@ -73,7 +77,7 @@ class ReceiptSummary:
 
 
 # ==========================================
-# 3. OCR Parser Logic
+# 3. Robust OCR Parser Logic
 # ==========================================
 
 def clean_amount(val_str: str) -> float:
@@ -95,15 +99,20 @@ def parse_receipt(raw_text: str) -> ReceiptSummary:
     lines = [line.strip() for line in raw_lines if line.strip()]
 
     item_aggregation: Dict[str, Dict[str, float]] = {}
+    
+    # Enhanced stop keywords to prevent footer lines from becoming items
     stop_keywords = [
-        "sub total", "subtotal", "sales tax", "total due", 
-        "card", "change", "total savings", "thank you", "mylidl"
+        "sub total", "subtotal", "sub tota", "sales tax", "sales tay", 
+        "total due", "total", "card", "change", "total savings", 
+        "thank you", "mylidl"
     ]
 
     pending_qty: int = 1
 
     for line in lines:
         line_lower = line.lower()
+        
+        # Stop parsing once reaching subtotal or tax sections
         if any(keyword in line_lower for keyword in stop_keywords):
             break
 
@@ -122,9 +131,9 @@ def parse_receipt(raw_text: str) -> ReceiptSummary:
             raw_name, price_str = item_match.groups()
             clean_name = re.sub(r"[{}|~‘'\"\[\]]", "", raw_name).strip().title()
 
-            if any(h in clean_name.lower() for h in ["welcome", "store", "organic", "item"]):
-                if not re.search(r"\d", clean_name):
-                    continue
+            # Additional check to ensure footer typos aren't added as items
+            if any(k in clean_name.lower() for k in ["sub tota", "sub total", "sales tay", "sales tax"]):
+                break
 
             total_line_price = clean_amount(price_str)
             qty = pending_qty if pending_qty > 0 else 1
@@ -150,8 +159,9 @@ def parse_receipt(raw_text: str) -> ReceiptSummary:
             )
         )
 
+    # Tax Extraction
     sales_tax = 0.0
-    tax_match = re.search(r"(?:sales\s*tax|tax)[\s:]*[\$€]?\s*([\d,]+\.\d{2})", raw_text, re.I)
+    tax_match = re.search(r"(?:sales\s*tax|sales\s*tay|tax)[\s:]*[\$€]?\s*([\d,]+\.\d{2})", raw_text, re.I)
     if tax_match:
         sales_tax = clean_amount(tax_match.group(1))
 
@@ -176,7 +186,6 @@ def main():
     st.markdown('<div class="main-title">🧾 Smart Receipt Analytics & Parser</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-title">Automated OCR Extraction with Multiplied Unit-Pricing and Real-Time Interactive Editing.</div>', unsafe_allow_html=True)
 
-    # Sidebar for control options
     st.sidebar.header("⚙️ OCR Settings")
     psm_mode = st.sidebar.selectbox("Tesseract Page Segmentation Mode", ["PSM 6 (Single Uniform Block)", "PSM 4 (Column Detection)"], index=0)
     config_flag = r'--oem 1 --psm 6' if "PSM 6" in psm_mode else r'--oem 1 --psm 4'
@@ -186,7 +195,6 @@ def main():
     if uploaded_file is not None:
         image = PIL.Image.open(uploaded_file)
         
-        # Tabs layout for structured user journey
         tab1, tab2 = st.tabs(["📑 Review & Edit Items", "🔍 Raw OCR Output"])
 
         with tab1:
@@ -208,7 +216,6 @@ def main():
                         st.error(f"OCR Processing Error: {e}")
                         return
 
-                # Build initial structure for data_editor
                 initial_data = [
                     {
                         "Product Description": item.item_name,
@@ -222,7 +229,6 @@ def main():
                     initial_data if initial_data else [{"Product Description": "", "Quantity": 1, "Unit Price ($)": 0.0}]
                 )
 
-                # Editable interactive table
                 edited_df = st.data_editor(
                     df_initial,
                     num_rows="dynamic",
@@ -234,12 +240,10 @@ def main():
                     use_container_width=True
                 )
 
-                # Automatic Multiplication: Quantity x Unit Price = Line Total
                 edited_df["Quantity"] = pd.to_numeric(edited_df["Quantity"], errors="coerce").fillna(0).astype(int)
                 edited_df["Unit Price ($)"] = pd.to_numeric(edited_df["Unit Price ($)"], errors="coerce").fillna(0.0)
                 edited_df["Line Total ($)"] = edited_df["Quantity"] * edited_df["Unit Price ($)"]
 
-                # Display calculated line totals view below
                 st.markdown("##### 🛒 Calculated Itemized Breakdown")
                 st.dataframe(
                     edited_df[["Product Description", "Quantity", "Unit Price ($)", "Line Total ($)"]],
@@ -250,7 +254,7 @@ def main():
                     use_container_width=True
                 )
 
-        # Dynamic KPI metric cards calculation
+        # Dynamic Financial Metrics Calculation
         updated_item_count = int(edited_df["Quantity"].sum())
         updated_subtotal = float(edited_df["Line Total ($)"].sum())
         updated_grand_total = updated_subtotal + summary.sales_tax
@@ -264,7 +268,6 @@ def main():
         m3.metric("Sales Tax", f"${summary.sales_tax:,.2f}")
         m4.metric("Grand Total Due", f"${updated_grand_total:,.2f}")
 
-        # CSV Export feature
         st.markdown("<br>", unsafe_allow_html=True)
         csv_data = edited_df.to_csv(index=False).encode('utf-8')
         st.download_button(
