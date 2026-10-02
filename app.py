@@ -7,25 +7,60 @@ import PIL.Image
 import pytesseract
 import streamlit as st
 
+# ==========================================
+# 1. Page Config & Custom Styling
+# ==========================================
+
 st.set_page_config(
-    page_title="Universal Receipt OCR Parser & Editor",
+    page_title="Smart Receipt Analytics",
     page_icon="🧾",
-    layout="centered"
+    layout="wide"
 )
 
+# Inject CSS for polished dashboard visuals
+st.markdown("""
+<style>
+    /* Metric Card Styling */
+    div[data-testid="stMetric"] {
+        background-color: #f8f9fa;
+        border: 1px solid #e9ecef;
+        padding: 15px 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+    }
+    div[data-testid="stMetric"] label {
+        font-weight: 600;
+        color: #495057;
+    }
+    /* Main Header Styling */
+    .main-title {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #1E293B;
+        margin-bottom: 0.2rem;
+    }
+    .sub-title {
+        font-size: 1rem;
+        color: #64748B;
+        margin-bottom: 1.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
 # ==========================================
-# 1. Data Structures
+# 2. Data Structures
 # ==========================================
 
 @dataclass
 class AggregatedItem:
     item_name: str
     quantity: int
-    total_price: float
+    unit_price: float
 
     @property
-    def unit_price(self) -> float:
-        return round(self.total_price / self.quantity, 2) if self.quantity > 0 else 0.0
+    def total_price(self) -> float:
+        return round(self.quantity * self.unit_price, 2)
 
 
 @dataclass
@@ -38,11 +73,11 @@ class ReceiptSummary:
 
 
 # ==========================================
-# 2. Resilient US/Global Receipt Parser
+# 3. OCR Parser Logic
 # ==========================================
 
 def clean_amount(val_str: str) -> float:
-    """Extracts floating point values while ignoring OCR artifacts and tax flags (FT, F, T)."""
+    """Strips non-numeric noise and converts text to float."""
     cleaned = re.sub(r"(?i)\b(FT|F|T|WT)\b", "", str(val_str))
     sanitized = re.sub(r"[^\d.]", "", cleaned)
     
@@ -55,12 +90,11 @@ def clean_amount(val_str: str) -> float:
         return 0.0
 
 
-def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
+def parse_receipt(raw_text: str) -> ReceiptSummary:
     raw_lines = raw_text.splitlines()
     lines = [line.strip() for line in raw_lines if line.strip()]
 
     item_aggregation: Dict[str, Dict[str, float]] = {}
-    
     stop_keywords = [
         "sub total", "subtotal", "sales tax", "total due", 
         "card", "change", "total savings", "thank you", "mylidl"
@@ -70,10 +104,10 @@ def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
 
     for line in lines:
         line_lower = line.lower()
-
         if any(keyword in line_lower for keyword in stop_keywords):
             break
 
+        # Check for unit multiplier lines (e.g., "2.0 @ 2.99" or "4.02 lb @ $0.59/lb")
         qty_modifier_match = re.search(r"^(\d+(?:\.\d+)?)\s*(?:lb|pcs|x)?\s*@\s*[\$€]?\s*([\d.]+)", line, re.I)
         if qty_modifier_match:
             try:
@@ -92,16 +126,16 @@ def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
                 if not re.search(r"\d", clean_name):
                     continue
 
-            price = clean_amount(price_str)
+            total_line_price = clean_amount(price_str)
             qty = pending_qty if pending_qty > 0 else 1
+            unit_price = round(total_line_price / qty, 2) if qty > 0 else total_line_price
 
             if clean_name in item_aggregation:
                 item_aggregation[clean_name]["quantity"] += qty
-                item_aggregation[clean_name]["total_price"] += price
             else:
                 item_aggregation[clean_name] = {
                     "quantity": qty,
-                    "total_price": price
+                    "unit_price": unit_price
                 }
 
             pending_qty = 1
@@ -112,27 +146,17 @@ def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
             AggregatedItem(
                 item_name=name,
                 quantity=int(data["quantity"]),
-                total_price=round(data["total_price"], 2)
+                unit_price=float(data["unit_price"])
             )
         )
-
-    subtotal = 0.0
-    subtotal_match = re.search(r"(?:sub\s*total|subtotal)[\s:]*[\$€]?\s*([\d,]+\.\d{2})", raw_text, re.I)
-    if subtotal_match:
-        subtotal = clean_amount(subtotal_match.group(1))
 
     sales_tax = 0.0
     tax_match = re.search(r"(?:sales\s*tax|tax)[\s:]*[\$€]?\s*([\d,]+\.\d{2})", raw_text, re.I)
     if tax_match:
         sales_tax = clean_amount(tax_match.group(1))
 
-    grand_total = 0.0
-    total_match = re.search(r"(?:total\s*due|grand\s*total|total)[\s:]*[\$€]?\s*([\d,]+\.\d{2})", raw_text, re.I)
-    if total_match:
-        grand_total = clean_amount(total_match.group(1))
-    else:
-        grand_total = round(subtotal + sales_tax, 2)
-
+    subtotal = sum(item.total_price for item in items_list)
+    grand_total = subtotal + sales_tax
     total_items_count = sum(item.quantity for item in items_list)
 
     return ReceiptSummary(
@@ -145,81 +169,113 @@ def parse_lidl_us_receipt(raw_text: str) -> ReceiptSummary:
 
 
 # ==========================================
-# 3. Streamlit Interface
+# 4. Streamlit Application
 # ==========================================
 
 def main():
-    st.title("🧾 Interactive Receipt OCR Parser")
-    st.write("Upload a receipt image to extract items, then manually edit or add rows if OCR misreads any text.")
+    st.markdown('<div class="main-title">🧾 Smart Receipt Analytics & Parser</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-title">Automated OCR Extraction with Multiplied Unit-Pricing and Real-Time Interactive Editing.</div>', unsafe_allow_html=True)
 
-    uploaded_file = st.file_uploader("Upload Receipt", type=["png", "jpg", "jpeg", "webp"])
+    # Sidebar for control options
+    st.sidebar.header("⚙️ OCR Settings")
+    psm_mode = st.sidebar.selectbox("Tesseract Page Segmentation Mode", ["PSM 6 (Single Uniform Block)", "PSM 4 (Column Detection)"], index=0)
+    config_flag = r'--oem 1 --psm 6' if "PSM 6" in psm_mode else r'--oem 1 --psm 4'
+
+    uploaded_file = st.file_uploader("Upload Receipt / Bill Image", type=["png", "jpg", "jpeg", "webp"])
 
     if uploaded_file is not None:
         image = PIL.Image.open(uploaded_file)
         
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            st.image(image, caption="Uploaded Receipt", use_container_width=True)
+        # Tabs layout for structured user journey
+        tab1, tab2 = st.tabs(["📑 Review & Edit Items", "🔍 Raw OCR Output"])
 
-        with col2:
-            with st.spinner("Executing OCR & Extracting Items..."):
-                try:
-                    custom_config = r'--oem 1 --psm 6'
-                    raw_text = pytesseract.image_to_string(image, config=custom_config)
-                    summary = parse_lidl_us_receipt(raw_text)
-                    st.success("OCR extraction finished!")
-                except Exception as e:
-                    st.error(f"OCR Execution Error: {e}")
-                    return
+        with tab1:
+            col_img, col_data = st.columns([1, 1.3], gap="medium")
 
-        st.divider()
+            with col_img:
+                st.subheader("🖼️ Document Preview")
+                st.image(image, use_container_width=True)
 
-        st.subheader("📝 Edit & Review Extracted Items")
-        st.caption("You can directly edit item names, quantities, or prices in the table below, or click '+' to add missing items.")
+            with col_data:
+                st.subheader("✏️ Interactive Expense Table")
+                st.caption("Editing **Quantity** or **Unit Price** automatically re-calculates the **Total Price** and metrics.")
 
-        # Prepare Pandas DataFrame for st.data_editor
-        initial_data = [
-            {
-                "Product Description": item.item_name,
-                "Quantity": item.quantity,
-                "Total Price ($)": item.total_price
-            }
-            for item in summary.items
-        ]
-        
-        df_initial = pd.DataFrame(initial_data if initial_data else [{"Product Description": "", "Quantity": 1, "Total Price ($)": 0.0}])
+                with st.spinner("Extracting text and calculating line items..."):
+                    try:
+                        raw_text = pytesseract.image_to_string(image, config=config_flag)
+                        summary = parse_receipt(raw_text)
+                    except Exception as e:
+                        st.error(f"OCR Processing Error: {e}")
+                        return
 
-        # Interactive Editable Table
-        edited_df = st.data_editor(
-            df_initial,
-            num_rows="dynamic",  # Allows adding/deleting rows
-            column_config={
-                "Product Description": st.column_config.TextColumn("Product Description", required=True),
-                "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
-                "Total Price ($)": st.column_config.NumberColumn("Total Price ($)", min_value=0.0, format="$%.2f", required=True)
-            },
-            use_container_width=True
-        )
+                # Build initial structure for data_editor
+                initial_data = [
+                    {
+                        "Product Description": item.item_name,
+                        "Quantity": item.quantity,
+                        "Unit Price ($)": item.unit_price,
+                    }
+                    for item in summary.items
+                ]
 
-        # Recalculate metrics in real-time from user's edits
-        edited_df["Quantity"] = pd.to_numeric(edited_df["Quantity"], errors="coerce").fillna(0).astype(int)
-        edited_df["Total Price ($)"] = pd.to_numeric(edited_df["Total Price ($)"], errors="coerce").fillna(0.0)
+                df_initial = pd.DataFrame(
+                    initial_data if initial_data else [{"Product Description": "", "Quantity": 1, "Unit Price ($)": 0.0}]
+                )
 
+                # Editable interactive table
+                edited_df = st.data_editor(
+                    df_initial,
+                    num_rows="dynamic",
+                    column_config={
+                        "Product Description": st.column_config.TextColumn("Product Description", required=True),
+                        "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
+                        "Unit Price ($)": st.column_config.NumberColumn("Unit Price ($)", min_value=0.0, format="$%.2f", required=True)
+                    },
+                    use_container_width=True
+                )
+
+                # Automatic Multiplication: Quantity x Unit Price = Line Total
+                edited_df["Quantity"] = pd.to_numeric(edited_df["Quantity"], errors="coerce").fillna(0).astype(int)
+                edited_df["Unit Price ($)"] = pd.to_numeric(edited_df["Unit Price ($)"], errors="coerce").fillna(0.0)
+                edited_df["Line Total ($)"] = edited_df["Quantity"] * edited_df["Unit Price ($)"]
+
+                # Display calculated line totals view below
+                st.markdown("##### 🛒 Calculated Itemized Breakdown")
+                st.dataframe(
+                    edited_df[["Product Description", "Quantity", "Unit Price ($)", "Line Total ($)"]],
+                    column_config={
+                        "Unit Price ($)": st.column_config.NumberColumn(format="$%.2f"),
+                        "Line Total ($)": st.column_config.NumberColumn(format="$%.2f")
+                    },
+                    use_container_width=True
+                )
+
+        # Dynamic KPI metric cards calculation
         updated_item_count = int(edited_df["Quantity"].sum())
-        updated_subtotal = float(edited_df["Total Price ($)"].sum())
+        updated_subtotal = float(edited_df["Line Total ($)"].sum())
         updated_grand_total = updated_subtotal + summary.sales_tax
 
         st.divider()
 
-        # Dynamic Financial Metrics Display
-        st.subheader("📊 Dynamic Summary")
+        st.subheader("📊 Dynamic Financial Dashboard")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total Items Count", f"{updated_item_count} pcs")
-        m2.metric("Subtotal", f"${updated_subtotal:,.2f}")
+        m2.metric("Calculated Subtotal", f"${updated_subtotal:,.2f}")
         m3.metric("Sales Tax", f"${summary.sales_tax:,.2f}")
-        m4.metric("Total Due", f"${updated_grand_total:,.2f}")
+        m4.metric("Grand Total Due", f"${updated_grand_total:,.2f}")
 
-        with st.expander("View Raw OCR Text"):
+        # CSV Export feature
+        st.markdown("<br>", unsafe_allow_html=True)
+        csv_data = edited_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Export Expense Report (CSV)",
+            data=csv_data,
+            file_name=f"receipt_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+        )
+
+        with tab2:
+            st.subheader("🔍 OCR Text Output")
             st.code(raw_text)
 
 if __name__ == "__main__":
